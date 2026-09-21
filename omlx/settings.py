@@ -308,6 +308,14 @@ class SchedulerSettings:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk runs. Off restores the pre-fairness behavior.
     decode_fairness: bool = True
+    prefill_max_batch_size: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.prefill_max_batch_size) is not int
+            or self.prefill_max_batch_size <= 0
+        ):
+            raise ValueError("prefill_max_batch_size must be a positive integer")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -331,6 +339,7 @@ class SchedulerSettings:
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
+            prefill_max_batch_size=data.get("prefill_max_batch_size", 1),
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
@@ -1665,6 +1674,11 @@ class GlobalSettings:
                 f"Invalid embedding_batch_size: "
                 f"{self.scheduler.embedding_batch_size} (must be > 0)"
             )
+        if (
+            type(self.scheduler.prefill_max_batch_size) is not int
+            or self.scheduler.prefill_max_batch_size <= 0
+        ):
+            errors.append("prefill_max_batch_size must be a positive integer")
 
         # Cache validation
         if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
@@ -1826,6 +1840,7 @@ class GlobalSettings:
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
+            prefill_max_batch_size=self.scheduler.prefill_max_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
