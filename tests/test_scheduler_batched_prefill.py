@@ -1635,7 +1635,13 @@ def test_transition_rechecks_memory_before_allocating_scalar_caches(
         raise AssertionError("memory guard must run before extraction")
 
     def lose_headroom():
-        monkeypatch.setattr(scheduler, "_current_usage_bytes", lambda: 10**13)
+        # Exceed transition admission headroom, but stay below the physical
+        # cap so this exercises the transition guard, not the post-forward guard.
+        monkeypatch.setattr(
+            scheduler,
+            "_current_usage_bytes",
+            lambda: scheduler._prefill_abort_cap() + 1,
+        )
 
     monkeypatch.setattr(group, "extract", forbidden_extract)
     monkeypatch.setattr(
@@ -1730,7 +1736,7 @@ def test_transition_reclaim_preserves_completed_work(
         return usage.value
 
     def lose_headroom():
-        usage.value = 10**13
+        usage.value = scheduler._prefill_abort_cap() + 1
 
     monkeypatch.setattr(scheduler, "_reclaim_prefill_headroom", reclaim)
     scheduled, rejected = [], []
@@ -1875,3 +1881,82 @@ def test_failed_forward_counts_only_previously_materialized_requeued_work(
     assert stats["tokens"] == stats["discarded_tokens"] == stats["requeued_tokens"] == 8
     assert all(request.prefill_oom_retries == 1 for request in requests)
     assert "outcome=failed phase=forward" in caplog.text
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("prompt_tokens", [5, 9])
+def test_post_forward_over_cap_stops_before_cache_transitions(
+    scheduler_factory, monkeypatch, batch_size, prompt_tokens
+):
+    """Check actual occupancy even when a chunk has no completed rows."""
+    harness = scheduler_factory(prefill_max_batch_size=batch_size)
+    scheduler = harness.scheduler
+    usage = SimpleNamespace(value=1)
+    monkeypatch.setattr(scheduler, "_current_usage_bytes", lambda: usage.value)
+    reclaim = MagicMock(side_effect=lambda: usage.value)
+    monkeypatch.setattr(scheduler, "_reclaim_prefill_headroom", reclaim)
+    monkeypatch.setattr(
+        scheduler, "_requeue_or_fail_prefill", lambda *args, **kwargs: False
+    )
+    transition = MagicMock(wraps=scheduler._guard_prefill_group_transition)
+    monkeypatch.setattr(scheduler, "_guard_prefill_group_transition", transition)
+    harness.forward_hook = lambda: setattr(usage, "value", 2 * 10**12)
+    requests = [make_request(f"row-{i}", prompt_tokens) for i in range(batch_size)]
+    add_requests(scheduler, *requests)
+
+    scheduled, rejected = scheduler._schedule_waiting()
+
+    assert forward_shapes(harness) == [(batch_size, 4)]
+    reclaim.assert_called_once()
+    transition.assert_not_called()
+    harness.batch_generator.insert.assert_not_called()
+    assert not scheduled
+    assert {output.request_id for output in rejected} == {
+        r.request_id for r in requests
+    }
+    assert all("Memory limit exceeded" in output.error for output in rejected)
+    assert not scheduler._prefill_runtime.has_groups
+    assert not scheduler._prefill_states
+    assert not scheduler.running
+    if batch_size > 1:
+        stats = scheduler._batched_prefill_stats
+        assert stats["tokens"] == stats["discarded_tokens"] == batch_size * 4
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_post_forward_reclaim_precedes_handoff_and_retains_work(
+    scheduler_factory, monkeypatch, batch_size
+):
+    harness = scheduler_factory(prefill_max_batch_size=batch_size)
+    scheduler = harness.scheduler
+    usage = SimpleNamespace(value=1)
+    events = []
+    monkeypatch.setattr(scheduler, "_current_usage_bytes", lambda: usage.value)
+
+    def reclaim():
+        events.append("reclaim")
+        usage.value = 1
+        return usage.value
+
+    original_transition = scheduler._guard_prefill_group_transition
+
+    def transition(*args):
+        events.append("transition")
+        return original_transition(*args)
+
+    monkeypatch.setattr(scheduler, "_reclaim_prefill_headroom", reclaim)
+    monkeypatch.setattr(scheduler, "_guard_prefill_group_transition", transition)
+    harness.forward_hook = lambda: setattr(usage, "value", 2 * 10**12)
+    requests = [make_request(f"row-{i}", 5) for i in range(batch_size)]
+    add_requests(scheduler, *requests)
+
+    scheduled, rejected = scheduler._schedule_waiting()
+
+    assert not rejected
+    assert events[0] == "reclaim"
+    assert events.count("reclaim") == 1
+    assert forward_shapes(harness) == [(batch_size, 4)]
+    assert scheduled == requests
+    assert harness.batch_generator.insert.call_count == batch_size
+    assert all(request.prefill_oom_retries == 0 for request in requests)
+    assert not scheduler._prefill_runtime.has_groups
