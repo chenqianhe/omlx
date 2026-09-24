@@ -14,7 +14,7 @@ from mlx_lm.models.cache import KVCache, make_prompt_cache
 
 from omlx.decode_activity import get_decode_activity
 from omlx.prefill.memory import PrefillTransition
-from omlx.prefill.planning import PrefillRun, plan_prefill_batch
+from omlx.prefill.planning import PrefillDefer, PrefillReason, PrefillRun, plan_prefill_batch
 from omlx.prefill.timing import PrefillTiming
 from omlx.prefill_progress import get_prefill_tracker
 from omlx.request import Request, RequestStatus, SamplingParams
@@ -1469,7 +1469,41 @@ def test_time_only_rejection_demotes_live_group_without_replaying_prefill(
         assert_insert_matches_single(harness, request, insertion)
 
 
-def test_memory_rejection_cannot_use_the_time_only_demotion_path(
+def test_memory_rejection_preserves_kv_when_transition_fits(
+    scheduler_factory, monkeypatch
+):
+    harness = scheduler_factory()
+    scheduler = harness.scheduler
+    requests = [make_request("first"), make_request("second", start=15)]
+    add_requests(scheduler, *requests)
+    scheduler._schedule_waiting()
+    first_call = len(harness.calls)
+    original_plan = scheduler._plan_batched_prefill
+    monkeypatch.setattr(
+        scheduler, "_plan_batched_prefill",
+        lambda *args: PrefillDefer(PrefillReason.MEMORY_LIMIT),
+    )
+    rejected = []
+    scheduler._advance_chunked_prefills([], rejected)
+    assert not rejected
+    assert not scheduler._prefill_runtime.has_groups
+    assert len(harness.calls) == first_call
+    assert scheduler._batched_prefill_stats["memory_demotions"] == 1
+    assert scheduler._batched_prefill_stats["discarded_tokens"] == 0
+    assert scheduler._batched_prefill_stats["requeued_tokens"] == 0
+    for state in scheduler._prefill_states.values():
+        assert state.tokens_processed == 4
+        assert all(type(layer) is KVCache and layer.offset == 4 for layer in state.cache)
+    monkeypatch.setattr(scheduler, "_plan_batched_prefill", original_plan)
+    _, rejected = finish_prefills(scheduler)
+    assert not rejected
+    assert all(call.shape == (1, 4) for call in harness.calls[first_call:])
+    assert all(request.prefill_oom_retries == 0 for request in requests)
+    for request, insertion in zip(requests, harness.batch_generator.insert.call_args_list):
+        assert_insert_matches_single(harness, request, insertion)
+
+
+def test_memory_rejection_cannot_demote_without_transition_headroom(
     scheduler_factory, monkeypatch
 ):
     harness = scheduler_factory()

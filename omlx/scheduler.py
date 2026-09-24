@@ -1955,6 +1955,7 @@ class Scheduler:
             "padding_tokens": 0,
             "discarded_tokens": 0,
             "requeued_tokens": 0,
+            "memory_demotions": 0,
             "forward_seconds": 0.0,
             "step_seconds": 0.0,
             "transition_reclaims": 0,
@@ -5888,6 +5889,19 @@ class Scheduler:
                     return
                 self._reclaim_prefill_headroom()
                 decision = self._plan_batched_prefill(states, group)
+            if (
+                isinstance(decision, PrefillDefer)
+                and decision.reason is PrefillReason.MEMORY_LIMIT
+            ):
+                # A future batched forward may not fit even when copying the
+                # existing KV does. Admit that transition independently and
+                # preserve completed work; scalar execution retains its own
+                # forward guards. If the copy cannot fit, normal recovery runs.
+                phase = "demotion"
+                self._dissolve_prefill_group(group)
+                self._batched_prefill_stats["memory_demotions"] += 1
+                outcome = "demoted"
+                return
             if (
                 isinstance(decision, PrefillFallback)
                 and decision.reason is PrefillReason.DURATION_LIMIT
