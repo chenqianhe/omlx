@@ -40,8 +40,10 @@ class RecordingModel:
 @pytest.fixture
 def engine_stream():
     stream = mx.new_thread_local_stream(mx.default_device())
+    # Cleanup must not invoke stream assertions installed by individual tests.
+    synchronize = mx.synchronize
     yield stream
-    mx.synchronize(stream)
+    synchronize(stream)
 
 
 @pytest.fixture
